@@ -113,21 +113,28 @@ function handleJoin(ws, data) {
     }
     
     ws.roomId = roomId;
+    const isInitiator = room.size === 0; // First person is the initiator
     room.add(ws);
     
     // Notify client they joined successfully
     ws.send(JSON.stringify({ 
         type: 'joined', 
         roomId,
-        participantCount: room.size 
+        participantCount: room.size,
+        isInitiator: isInitiator  // Tell them if they should create offer
     }));
     
-    // If second person joins, notify both
+    // If second person joins, tell first person to create offer
     if (room.size === 2) {
-        broadcastToRoom(roomId, { type: 'ready' });
+        room.forEach(client => {
+            if (client !== ws && client.readyState === WebSocket.OPEN) {
+                // Tell the first person (initiator) to start
+                client.send(JSON.stringify({ type: 'start-call' }));
+            }
+        });
     }
     
-    console.log(`Client joined room: ${roomId}, participants: ${room.size}`);
+    console.log(`Client joined room: ${roomId}, participants: ${room.size}, isInitiator: ${isInitiator}`);
 }
 
 function handleSignaling(ws, data) {

@@ -26,6 +26,7 @@
                 this.localStream = null;
                 this.remoteStream = null;
                 this.roomId = null;
+                this.isInitiator = false;
                 this.dataChannel = null;
                 this.mediaRecorder = null;
                 this.recordedChunks = [];
@@ -50,17 +51,21 @@
 
             async fetchIceServers() {
                 try {
+                    console.log('Fetching ICE servers...');
                     const response = await fetch('/api/ice-servers');
                     const data = await response.json();
                     this.iceServers = data;
-                    console.log('ICE servers loaded:', data.iceServers.length, 'servers');
+                    console.log('✓ ICE servers loaded:', data.iceServers.length, 'servers');
+                    console.log('ICE servers:', data.iceServers);
                     
                     // Check if TURN servers are available
                     const hasTurn = data.iceServers.some(server => 
                         server.urls && server.urls.toString().includes('turn:')
                     );
                     
-                    if (!hasTurn) {
+                    if (hasTurn) {
+                        console.log('✓ TURN servers configured');
+                    } else {
                         console.warn('⚠ No TURN servers configured. May have issues with strict NAT/firewall.');
                     }
                 } catch (error) {
@@ -72,6 +77,7 @@
                             { urls: 'stun:stun1.l.google.com:19302' }
                         ]
                     };
+                    console.log('Using fallback STUN servers');
                 }
             }
 
@@ -105,14 +111,23 @@
             async handleSignalingMessage(data) {
                 switch (data.type) {
                     case 'joined':
-                        console.log('Joined room:', data.roomId);
-                        if (data.participantCount === 2) {
-                            this.updateStatus('Partner joined. Starting call...', 'blue');
+                        console.log('Joined room:', data.roomId, 'Participants:', data.participantCount);
+                        console.log('Is initiator:', data.isInitiator);
+                        this.isInitiator = data.isInitiator;
+                        
+                        if (data.participantCount === 1) {
+                            this.updateStatus('Waiting for partner...', 'blue');
+                        } else if (data.participantCount === 2) {
+                            this.updateStatus('Partner joined. Connecting...', 'blue');
                         }
                         break;
                         
-                    case 'ready':
-                        await this.startCall();
+                    case 'start-call':
+                        // Only the initiator (first person) should create offer
+                        if (this.isInitiator && !this.pc) {
+                            console.log('Starting call as initiator');
+                            await this.startCall();
+                        }
                         break;
                         
                     case 'offer':
@@ -197,33 +212,45 @@
             }
 
             async startCall() {
+                console.log('=== Starting Call ===');
                 this.updateStatus('Establishing connection...', 'blue');
                 
                 // Create peer connection
+                console.log('Creating peer connection with ICE servers:', this.iceServers);
                 this.pc = new RTCPeerConnection(this.iceServers);
                 
                 // Add tracks
+                console.log('Adding local tracks:', this.localStream.getTracks().length);
                 this.localStream.getTracks().forEach(track => {
+                    console.log('Adding track:', track.kind, track.id);
                     this.pc.addTrack(track, this.localStream);
                 });
                 
                 // Handle remote stream
                 this.pc.ontrack = (event) => {
-                    console.log('Received remote track:', event.track.kind);
+                    console.log('🎉 Received remote track:', event.track.kind, event.track.id);
+                    console.log('Remote stream:', event.streams[0]);
                     if (!this.remoteStream) {
                         this.remoteStream = event.streams[0];
-                        document.getElementById('remoteVideo').srcObject = this.remoteStream;
+                        const remoteVideo = document.getElementById('remoteVideo');
+                        remoteVideo.srcObject = this.remoteStream;
+                        console.log('✓ Set remote video srcObject');
                         this.updateStatus('Connected!', 'green');
                     }
                 };
                 
                 // Handle ICE candidates
                 this.pc.onicecandidate = (event) => {
-                    if (event.candidate && this.ws.readyState === WebSocket.OPEN) {
-                        this.ws.send(JSON.stringify({
-                            type: 'ice-candidate',
-                            candidate: event.candidate
-                        }));
+                    if (event.candidate) {
+                        console.log('ICE candidate:', event.candidate.type, event.candidate.candidate);
+                        if (this.ws.readyState === WebSocket.OPEN) {
+                            this.ws.send(JSON.stringify({
+                                type: 'ice-candidate',
+                                candidate: event.candidate
+                            }));
+                        }
+                    } else {
+                        console.log('ICE gathering complete');
                     }
                 };
                 
@@ -232,7 +259,14 @@
                     console.log('Connection state:', this.pc.connectionState);
                     if (this.pc.connectionState === 'connected') {
                         this.updateStatus('Connected!', 'green');
+                    } else if (this.pc.connectionState === 'failed') {
+                        console.error('Connection failed!');
+                        this.updateStatus('Connection failed', 'red');
                     }
+                };
+                
+                this.pc.oniceconnectionstatechange = () => {
+                    console.log('ICE connection state:', this.pc.iceConnectionState);
                 };
                 
                 // Create data channel for chat
@@ -241,39 +275,56 @@
                 
                 // Handle incoming data channel
                 this.pc.ondatachannel = (event) => {
+                    console.log('Received data channel');
                     this.dataChannel = event.channel;
                     this.setupDataChannel(this.dataChannel);
                 };
                 
                 // Create and send offer
+                console.log('Creating offer...');
                 const offer = await this.pc.createOffer();
                 await this.pc.setLocalDescription(offer);
+                console.log('Sending offer');
                 
                 this.ws.send(JSON.stringify({
                     type: 'offer',
                     offer: this.pc.localDescription
                 }));
+                console.log('=== Call setup complete ===');
             }
 
             async handleOffer(offer) {
+                console.log('=== Handling Offer ===');
+                
+                // If we already have a peer connection and sent an offer, ignore this one
+                if (this.pc && this.pc.signalingState !== 'stable') {
+                    console.log('Already in signaling process, ignoring offer');
+                    return;
+                }
+                
                 if (!this.pc) {
+                    console.log('Creating peer connection for answer');
                     // Create peer connection if not already created
                     this.pc = new RTCPeerConnection(this.iceServers);
                     
                     this.localStream.getTracks().forEach(track => {
+                        console.log('Adding track:', track.kind);
                         this.pc.addTrack(track, this.localStream);
                     });
                     
                     this.pc.ontrack = (event) => {
+                        console.log('🎉 Received remote track:', event.track.kind);
                         if (!this.remoteStream) {
                             this.remoteStream = event.streams[0];
                             document.getElementById('remoteVideo').srcObject = this.remoteStream;
+                            console.log('✓ Set remote video srcObject');
                             this.updateStatus('Connected!', 'green');
                         }
                     };
                     
                     this.pc.onicecandidate = (event) => {
                         if (event.candidate && this.ws.readyState === WebSocket.OPEN) {
+                            console.log('Sending ICE candidate');
                             this.ws.send(JSON.stringify({
                                 type: 'ice-candidate',
                                 candidate: event.candidate
@@ -281,24 +332,57 @@
                         }
                     };
                     
+                    this.pc.onconnectionstatechange = () => {
+                        console.log('Connection state:', this.pc.connectionState);
+                        if (this.pc.connectionState === 'connected') {
+                            this.updateStatus('Connected!', 'green');
+                        } else if (this.pc.connectionState === 'failed') {
+                            console.error('Connection failed!');
+                            this.updateStatus('Connection failed', 'red');
+                        }
+                    };
+                    
+                    this.pc.oniceconnectionstatechange = () => {
+                        console.log('ICE connection state:', this.pc.iceConnectionState);
+                    };
+                    
                     this.pc.ondatachannel = (event) => {
+                        console.log('Received data channel');
                         this.dataChannel = event.channel;
                         this.setupDataChannel(this.dataChannel);
                     };
                 }
                 
+                console.log('Setting remote description (offer)');
                 await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
+                
+                console.log('Creating answer');
                 const answer = await this.pc.createAnswer();
                 await this.pc.setLocalDescription(answer);
                 
+                console.log('Sending answer');
                 this.ws.send(JSON.stringify({
                     type: 'answer',
                     answer: this.pc.localDescription
                 }));
+                console.log('=== Answer sent ===');
             }
 
             async handleAnswer(answer) {
+                console.log('=== Handling Answer ===');
+                if (!this.pc) {
+                    console.error('No peer connection exists!');
+                    return;
+                }
+                
+                if (this.pc.signalingState !== 'have-local-offer') {
+                    console.warn('Not in correct state for answer, current state:', this.pc.signalingState);
+                    return;
+                }
+                
+                console.log('Setting remote description (answer)');
                 await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
+                console.log('✓ Answer processed');
             }
 
             async handleIceCandidate(candidate) {
@@ -797,7 +881,8 @@
 
         // Initialize app
         window.addEventListener('DOMContentLoaded', () => {
-            new CoffeeChatProduction();
+            window.app = new CoffeeChatProduction();
+            console.log('Coffee Chat initialized');
         });
     </script>
 </body>
