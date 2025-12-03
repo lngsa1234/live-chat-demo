@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Coffee Chat Pro - Production</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .animate-pulse {
+            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: .5; }
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div id="app"></div>
+
+    <script>
+        class CoffeeChatProduction {
+            constructor() {
+                this.ws = null;
+                this.pc = null;
+                this.localStream = null;
+                this.remoteStream = null;
+                this.roomId = null;
+                this.dataChannel = null;
+                this.mediaRecorder = null;
+                this.recordedChunks = [];
+                this.isRecording = false;
+                this.isSharingScreen = false;
+                this.screenStream = null;
+                this.originalVideoTrack = null;
+                this.chatMessages = [];
+                this.showChat = false;
+                this.videoSwapped = false;
+                this.iceServers = null;
+                
+                this.init();
+            }
+
+            async init() {
+                this.render();
+                this.setupEventListeners();
+                // Fetch ICE servers from backend
+                await this.fetchIceServers();
+            }
+
+            async fetchIceServers() {
+                try {
+                    const response = await fetch('/api/ice-servers');
+                    const data = await response.json();
+                    this.iceServers = data;
+                    console.log('ICE servers loaded:', data.iceServers.length, 'servers');
+                    
+                    // Check if TURN servers are available
+                    const hasTurn = data.iceServers.some(server => 
+                        server.urls && server.urls.toString().includes('turn:')
+                    );
+                    
+                    if (!hasTurn) {
+                        console.warn('⚠ No TURN servers configured. May have issues with strict NAT/firewall.');
+                    }
+                } catch (error) {
+                    console.error('Error fetching ICE servers:', error);
+                    // Fallback to STUN only
+                    this.iceServers = {
+                        iceServers: [
+                            { urls: 'stun:stun.l.google.com:19302' },
+                            { urls: 'stun:stun1.l.google.com:19302' }
+                        ]
+                    };
+                }
+            }
+
+            connectWebSocket() {
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}`;
+                
+                this.ws = new WebSocket(wsUrl);
+                
+                this.ws.onopen = () => {
+                    console.log('WebSocket connected');
+                    this.updateStatus('Connected to server', 'green');
+                };
+                
+                this.ws.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    this.handleSignalingMessage(data);
+                };
+                
+                this.ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    this.updateStatus('Connection error', 'red');
+                };
+                
+                this.ws.onclose = () => {
+                    console.log('WebSocket disconnected');
+                    this.updateStatus('Disconnected from server', 'red');
+                };
+            }
+
+            async handleSignalingMessage(data) {
+                switch (data.type) {
+                    case 'joined':
+                        console.log('Joined room:', data.roomId);
+                        if (data.participantCount === 2) {
+                            this.updateStatus('Partner joined. Starting call...', 'blue');
+                        }
+                        break;
+                        
+                    case 'ready':
+                        await this.startCall();
+                        break;
+                        
+                    case 'offer':
+                        await this.handleOffer(data.offer);
+                        break;
+                        
+                    case 'answer':
+                        await this.handleAnswer(data.answer);
+                        break;
+                        
+                    case 'ice-candidate':
+                        await this.handleIceCandidate(data.candidate);
+                        break;
+                        
+                    case 'chat':
+                        this.chatMessages.push({
+                            text: data.message,
+                            timestamp: data.timestamp,
+                            sender: 'remote'
+                        });
+                        this.renderChat();
+                        break;
+                        
+                    case 'peer-left':
+                        this.updateStatus('Partner left the call', 'red');
+                        alert('Your partner has left the call');
+                        this.endCall();
+                        break;
+                        
+                    case 'error':
+                        alert('Error: ' + data.message);
+                        break;
+                }
+            }
+
+            async joinRoom() {
+                const input = document.getElementById('roomIdInput');
+                this.roomId = input?.value.trim() || this.generateRoomId();
+                
+                if (!this.roomId) {
+                    alert('Please enter a room ID');
+                    return;
+                }
+                
+                this.updateStatus('Joining room...', 'blue');
+                
+                // Get media first
+                try {
+                    this.localStream = await navigator.mediaDevices.getUserMedia({
+                        video: { width: 1280, height: 720 },
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true
+                        }
+                    });
+                    
+                    // Show local video
+                    document.getElementById('localVideo').srcObject = this.localStream;
+                    
+                    // Connect WebSocket
+                    this.connectWebSocket();
+                    
+                    // Wait for connection then join
+                    this.ws.addEventListener('open', () => {
+                        this.ws.send(JSON.stringify({
+                            type: 'join',
+                            roomId: this.roomId
+                        }));
+                    });
+                    
+                    this.showScreen('callScreen');
+                    this.updateStatus('Waiting for partner...', 'blue');
+                    
+                    // Show room ID
+                    document.getElementById('roomIdDisplay').textContent = this.roomId;
+                    
+                } catch (error) {
+                    console.error('Error getting media:', error);
+                    alert('Could not access camera/microphone: ' + error.message);
+                }
+            }
+
+            async startCall() {
+                this.updateStatus('Establishing connection...', 'blue');
+                
+                // Create peer connection
+                this.pc = new RTCPeerConnection(this.iceServers);
+                
+                // Add tracks
+                this.localStream.getTracks().forEach(track => {
+                    this.pc.addTrack(track, this.localStream);
+                });
+                
+                // Handle remote stream
+                this.pc.ontrack = (event) => {
+                    console.log('Received remote track:', event.track.kind);
+                    if (!this.remoteStream) {
+                        this.remoteStream = event.streams[0];
+                        document.getElementById('remoteVideo').srcObject = this.remoteStream;
+                        this.updateStatus('Connected!', 'green');
+                    }
+                };
+                
+                // Handle ICE candidates
+                this.pc.onicecandidate = (event) => {
+                    if (event.candidate && this.ws.readyState === WebSocket.OPEN) {
+                        this.ws.send(JSON.stringify({
+                            type: 'ice-candidate',
+                            candidate: event.candidate
+                        }));
+                    }
+                };
+                
+                // Handle connection state
+                this.pc.onconnectionstatechange = () => {
+                    console.log('Connection state:', this.pc.connectionState);
+                    if (this.pc.connectionState === 'connected') {
+                        this.updateStatus('Connected!', 'green');
+                    }
+                };
+                
+                // Create data channel for chat
+                this.dataChannel = this.pc.createDataChannel('chat');
+                this.setupDataChannel(this.dataChannel);
+                
+                // Handle incoming data channel
+                this.pc.ondatachannel = (event) => {
+                    this.dataChannel = event.channel;
+                    this.setupDataChannel(this.dataChannel);
+                };
+                
+                // Create and send offer
+                const offer = await this.pc.createOffer();
+                await this.pc.setLocalDescription(offer);
+                
+                this.ws.send(JSON.stringify({
+                    type: 'offer',
+                    offer: this.pc.localDescription
+                }));
+            }
+
+            async handleOffer(offer) {
+                if (!this.pc) {
+                    // Create peer connection if not already created
+                    this.pc = new RTCPeerConnection(this.iceServers);
+                    
+                    this.localStream.getTracks().forEach(track => {
+                        this.pc.addTrack(track, this.localStream);
+                    });
+                    
+                    this.pc.ontrack = (event) => {
+                        if (!this.remoteStream) {
+                            this.remoteStream = event.streams[0];
+                            document.getElementById('remoteVideo').srcObject = this.remoteStream;
+                            this.updateStatus('Connected!', 'green');
+                        }
+                    };
+                    
+                    this.pc.onicecandidate = (event) => {
+                        if (event.candidate && this.ws.readyState === WebSocket.OPEN) {
+                            this.ws.send(JSON.stringify({
+                                type: 'ice-candidate',
+                                candidate: event.candidate
+                            }));
+                        }
+                    };
+                    
+                    this.pc.ondatachannel = (event) => {
+                        this.dataChannel = event.channel;
+                        this.setupDataChannel(this.dataChannel);
+                    };
+                }
+                
+                await this.pc.setRemoteDescription(new RTCSessionDescription(offer));
+                const answer = await this.pc.createAnswer();
+                await this.pc.setLocalDescription(answer);
+                
+                this.ws.send(JSON.stringify({
+                    type: 'answer',
+                    answer: this.pc.localDescription
+                }));
+            }
+
+            async handleAnswer(answer) {
+                await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
+            }
+
+            async handleIceCandidate(candidate) {
+                if (this.pc) {
+                    await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+                }
+            }
+
+            setupDataChannel(channel) {
+                channel.onopen = () => {
+                    console.log('Data channel opened');
+                };
+                
+                channel.onmessage = (event) => {
+                    const message = JSON.parse(event.data);
+                    this.chatMessages.push({ ...message, sender: 'remote' });
+                    this.renderChat();
+                };
+            }
+
+            sendMessage() {
+                const input = document.getElementById('messageInput');
+                const text = input?.value.trim();
+                
+                if (!text) return;
+                
+                const message = {
+                    text: text,
+                    timestamp: new Date().toISOString()
+                };
+                
+                // Send via data channel if available
+                if (this.dataChannel && this.dataChannel.readyState === 'open') {
+                    this.dataChannel.send(JSON.stringify(message));
+                } else if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    // Fallback to WebSocket
+                    this.ws.send(JSON.stringify({
+                        type: 'chat',
+                        message: message.text,
+                        timestamp: message.timestamp
+                    }));
+                }
+                
+                this.chatMessages.push({ ...message, sender: 'local' });
+                this.renderChat();
+                input.value = '';
+            }
+
+            toggleChat() {
+                this.showChat = !this.showChat;
+                const chatPanel = document.getElementById('chatPanel');
+                if (chatPanel) {
+                    chatPanel.style.display = this.showChat ? 'flex' : 'none';
+                }
+            }
+
+            renderChat() {
+                const chatMessages = document.getElementById('chatMessages');
+                if (!chatMessages) return;
+                
+                chatMessages.innerHTML = this.chatMessages.length === 0 
+                    ? '<div class="text-center text-gray-500 text-sm">No messages yet</div>'
+                    : this.chatMessages.map(msg => `
+                        <div class="flex ${msg.sender === 'local' ? 'justify-end' : 'justify-start'} mb-2">
+                            <div class="max-w-xs px-4 py-2 rounded-lg ${
+                                msg.sender === 'local' 
+                                    ? 'bg-blue-600 text-white' 
+                                    : 'bg-gray-700 text-white'
+                            }">
+                                <p class="text-sm">${msg.text}</p>
+                                <p class="text-xs opacity-70 mt-1">${new Date(msg.timestamp).toLocaleTimeString()}</p>
+                            </div>
+                        </div>
+                    `).join('');
+                
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+
+            async toggleScreenShare() {
+                if (this.isSharingScreen) {
+                    this.stopScreenShare();
+                } else {
+                    await this.startScreenShare();
+                }
+            }
+
+            async startScreenShare() {
+                try {
+                    this.screenStream = await navigator.mediaDevices.getDisplayMedia({
+                        video: true,
+                        audio: true
+                    });
+
+                    const screenTrack = this.screenStream.getVideoTracks()[0];
+                    this.originalVideoTrack = this.localStream.getVideoTracks()[0];
+                    
+                    const sender = this.pc.getSenders().find(s => s.track?.kind === 'video');
+                    if (sender) {
+                        sender.replaceTrack(screenTrack);
+                    }
+                    
+                    document.getElementById('localVideo').srcObject = this.screenStream;
+                    this.isSharingScreen = true;
+                    document.getElementById('shareScreen').textContent = '🛑 Stop Sharing';
+                    
+                    screenTrack.onended = () => {
+                        this.stopScreenShare();
+                    };
+                    
+                } catch (error) {
+                    console.error('Error sharing screen:', error);
+                }
+            }
+
+            stopScreenShare() {
+                if (this.screenStream) {
+                    this.screenStream.getTracks().forEach(track => track.stop());
+                }
+                
+                if (this.originalVideoTrack && this.pc) {
+                    const sender = this.pc.getSenders().find(s => s.track?.kind === 'video');
+                    if (sender) {
+                        sender.replaceTrack(this.originalVideoTrack);
+                    }
+                    document.getElementById('localVideo').srcObject = this.localStream;
+                }
+                
+                this.isSharingScreen = false;
+                this.screenStream = null;
+                document.getElementById('shareScreen').textContent = '🖥️ Share Screen';
+            }
+
+            toggleRecording() {
+                if (this.isRecording) {
+                    this.stopRecording();
+                } else {
+                    this.startRecording();
+                }
+            }
+
+            startRecording() {
+                try {
+                    const combinedStream = new MediaStream();
+                    
+                    if (this.localStream) {
+                        this.localStream.getTracks().forEach(track => combinedStream.addTrack(track));
+                    }
+                    
+                    const remoteVideo = document.getElementById('remoteVideo');
+                    if (remoteVideo.srcObject) {
+                        remoteVideo.srcObject.getTracks().forEach(track => combinedStream.addTrack(track));
+                    }
+                    
+                    let options = { mimeType: 'video/webm;codecs=vp9' };
+                    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                        options.mimeType = 'video/webm;codecs=vp8';
+                    }
+                    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                        options.mimeType = 'video/webm';
+                    }
+                    
+                    this.mediaRecorder = new MediaRecorder(combinedStream, options);
+                    this.recordedChunks = [];
+                    
+                    this.mediaRecorder.ondataavailable = (event) => {
+                        if (event.data.size > 0) {
+                            this.recordedChunks.push(event.data);
+                        }
+                    };
+                    
+                    this.mediaRecorder.onstop = () => {
+                        const blob = new Blob(this.recordedChunks, { type: 'video/webm' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `coffee-chat-${Date.now()}.webm`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                    };
+                    
+                    this.mediaRecorder.start();
+                    this.isRecording = true;
+                    
+                    const btn = document.getElementById('toggleRecord');
+                    btn.textContent = '⏹️ Stop Recording';
+                    btn.classList.add('bg-red-600', 'animate-pulse');
+                    btn.classList.remove('bg-gray-700');
+                    
+                } catch (error) {
+                    console.error('Error starting recording:', error);
+                }
+            }
+
+            stopRecording() {
+                if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+                    this.mediaRecorder.stop();
+                    this.isRecording = false;
+                    
+                    const btn = document.getElementById('toggleRecord');
+                    btn.textContent = '⏺️ Record';
+                    btn.classList.remove('bg-red-600', 'animate-pulse');
+                    btn.classList.add('bg-gray-700');
+                }
+            }
+
+            toggleAudio() {
+                if (this.localStream) {
+                    const enabled = !this.localStream.getAudioTracks()[0].enabled;
+                    this.localStream.getAudioTracks().forEach(track => track.enabled = enabled);
+                    document.getElementById('toggleAudio').textContent = enabled ? '🎤 Mute' : '🔇 Unmute';
+                }
+            }
+
+            toggleVideo() {
+                if (this.localStream) {
+                    const enabled = !this.localStream.getVideoTracks()[0].enabled;
+                    this.localStream.getVideoTracks().forEach(track => track.enabled = enabled);
+                    document.getElementById('toggleVideo').textContent = enabled ? '📹 Stop Video' : '📹 Start Video';
+                }
+            }
+
+            swapVideos() {
+                this.videoSwapped = !this.videoSwapped;
+                
+                const mainVideo = document.getElementById('mainVideoContainer');
+                const pipVideo = document.getElementById('pipVideoContainer');
+                const localVideo = document.getElementById('localVideo');
+                const remoteVideo = document.getElementById('remoteVideo');
+                
+                if (this.videoSwapped) {
+                    mainVideo.innerHTML = '';
+                    pipVideo.innerHTML = '';
+                    mainVideo.appendChild(remoteVideo);
+                    pipVideo.appendChild(localVideo);
+                    document.getElementById('mainLabel').textContent = 'Remote';
+                    document.getElementById('pipLabel').textContent = 'You';
+                } else {
+                    mainVideo.innerHTML = '';
+                    pipVideo.innerHTML = '';
+                    mainVideo.appendChild(localVideo);
+                    pipVideo.appendChild(remoteVideo);
+                    document.getElementById('mainLabel').textContent = 'You';
+                    document.getElementById('pipLabel').textContent = 'Remote';
+                }
+            }
+
+            endCall() {
+                if (this.localStream) {
+                    this.localStream.getTracks().forEach(track => track.stop());
+                }
+                if (this.screenStream) {
+                    this.screenStream.getTracks().forEach(track => track.stop());
+                }
+                if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+                    this.mediaRecorder.stop();
+                }
+                if (this.pc) {
+                    this.pc.close();
+                }
+                if (this.dataChannel) {
+                    this.dataChannel.close();
+                }
+                if (this.ws) {
+                    this.ws.send(JSON.stringify({ type: 'leave' }));
+                    this.ws.close();
+                }
+                
+                this.pc = null;
+                this.localStream = null;
+                this.remoteStream = null;
+                this.dataChannel = null;
+                this.screenStream = null;
+                this.chatMessages = [];
+                this.showChat = false;
+                this.isRecording = false;
+                this.isSharingScreen = false;
+                this.videoSwapped = false;
+                
+                this.showScreen('homeScreen');
+                this.updateStatus('', '');
+            }
+
+            copyRoomId() {
+                navigator.clipboard.writeText(this.roomId);
+                alert('Room ID copied! Share it with your partner.');
+            }
+
+            generateRoomId() {
+                return Math.random().toString(36).substring(2, 10);
+            }
+
+            showScreen(screenId) {
+                ['homeScreen', 'callScreen'].forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el) el.classList.add('hidden');
+                });
+                const screen = document.getElementById(screenId);
+                if (screen) screen.classList.remove('hidden');
+            }
+
+            updateStatus(message, color) {
+                const statusEl = document.getElementById('status');
+                if (statusEl) {
+                    statusEl.textContent = message;
+                    const colorClass = color === 'green' ? 'text-green-600' : 
+                                      color === 'red' ? 'text-red-600' : 'text-blue-600';
+                    statusEl.className = `text-sm mt-2 ${colorClass}`;
+                }
+            }
+
+            setupEventListeners() {
+                document.getElementById('joinBtn')?.addEventListener('click', () => this.joinRoom());
+                document.getElementById('createBtn')?.addEventListener('click', () => {
+                    document.getElementById('roomIdInput').value = this.generateRoomId();
+                    this.joinRoom();
+                });
+                document.getElementById('copyRoomId')?.addEventListener('click', () => this.copyRoomId());
+                document.getElementById('toggleAudio')?.addEventListener('click', () => this.toggleAudio());
+                document.getElementById('toggleVideo')?.addEventListener('click', () => this.toggleVideo());
+                document.getElementById('shareScreen')?.addEventListener('click', () => this.toggleScreenShare());
+                document.getElementById('toggleRecord')?.addEventListener('click', () => this.toggleRecording());
+                document.getElementById('toggleChat')?.addEventListener('click', () => this.toggleChat());
+                document.getElementById('sendMessage')?.addEventListener('click', () => this.sendMessage());
+                document.getElementById('swapVideos')?.addEventListener('click', () => this.swapVideos());
+                document.getElementById('endCall')?.addEventListener('click', () => this.endCall());
+                document.getElementById('messageInput')?.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') this.sendMessage();
+                });
+                document.getElementById('roomIdInput')?.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') this.joinRoom();
+                });
+            }
+
+            render() {
+                document.getElementById('app').innerHTML = `
+                    <!-- Home Screen -->
+                    <div id="homeScreen" class="min-h-screen flex items-center justify-center p-4 bg-gradient-to-br from-purple-50 to-blue-100">
+                        <div class="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full">
+                            <div class="text-center mb-8">
+                                <div class="text-6xl mb-4">☕</div>
+                                <h1 class="text-3xl font-bold mb-2 text-gray-800">Coffee Chat Pro</h1>
+                                <p class="text-gray-600">Production Ready Video Chat</p>
+                            </div>
+
+                            <div class="mb-6 grid grid-cols-3 gap-2 text-center">
+                                <div class="p-3 bg-blue-50 rounded-lg">
+                                    <div class="text-2xl mb-1">💬</div>
+                                    <div class="text-xs text-gray-700">Chat</div>
+                                </div>
+                                <div class="p-3 bg-green-50 rounded-lg">
+                                    <div class="text-2xl mb-1">🖥️</div>
+                                    <div class="text-xs text-gray-700">Screen Share</div>
+                                </div>
+                                <div class="p-3 bg-red-50 rounded-lg">
+                                    <div class="text-2xl mb-1">⏺️</div>
+                                    <div class="text-xs text-gray-700">Recording</div>
+                                </div>
+                            </div>
+
+                            <div class="space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 mb-2">Room ID</label>
+                                    <input 
+                                        type="text" 
+                                        id="roomIdInput" 
+                                        placeholder="Enter or create room ID" 
+                                        class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-transparent"
+                                    />
+                                </div>
+
+                                <button id="joinBtn" class="w-full bg-purple-600 hover:bg-purple-700 text-white font-semibold py-3 px-6 rounded-lg transition">
+                                    Join Room
+                                </button>
+
+                                <div class="relative">
+                                    <div class="absolute inset-0 flex items-center">
+                                        <div class="w-full border-t border-gray-300"></div>
+                                    </div>
+                                    <div class="relative flex justify-center text-sm">
+                                        <span class="px-2 bg-white text-gray-500">or</span>
+                                    </div>
+                                </div>
+
+                                <button id="createBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition">
+                                    Create New Room
+                                </button>
+                            </div>
+
+                            <div id="status" class="text-sm mt-4 text-center"></div>
+
+                            <div class="mt-6 p-4 bg-purple-50 border border-purple-200 rounded-lg">
+                                <p class="text-xs text-purple-800">
+                                    <strong>✨ Features:</strong> WebRTC P2P video, Real-time chat, Screen sharing, Call recording
+                                </p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Call Screen -->
+                    <div id="callScreen" class="hidden min-h-screen bg-gray-900">
+                        <div class="h-screen flex">
+                            <!-- Main video area -->
+                            <div class="flex-1 flex flex-col">
+                                <div class="bg-gray-800 p-4 flex items-center justify-between">
+                                    <div>
+                                        <h2 class="text-white font-bold text-xl">☕ Coffee Chat Pro</h2>
+                                        <div id="status" class="text-sm"></div>
+                                    </div>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-gray-400 text-sm">Room:</span>
+                                        <code id="roomIdDisplay" class="bg-gray-700 text-white px-3 py-1 rounded font-mono text-sm"></code>
+                                        <button id="copyRoomId" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded text-sm">
+                                            Copy
+                                        </button>
+                                    </div>
+                                </div>
+                                
+                                <div class="flex-1 p-4 relative">
+                                    <div class="relative bg-black rounded-xl overflow-hidden h-full">
+                                        <div id="mainVideoContainer" class="w-full h-full">
+                                            <video id="localVideo" autoplay playsinline muted class="w-full h-full object-cover"></video>
+                                        </div>
+                                        <div id="mainLabel" class="absolute top-4 left-4 bg-black bg-opacity-50 text-white px-3 py-1 rounded">You</div>
+                                        
+                                        <div class="absolute top-4 right-4 w-64 h-48 bg-black rounded-xl overflow-hidden border-2 border-white shadow-2xl cursor-pointer hover:border-blue-400 transition-colors" 
+                                             id="pipContainer"
+                                             onclick="document.getElementById('swapVideos').click()">
+                                            <div id="pipVideoContainer" class="w-full h-full">
+                                                <video id="remoteVideo" autoplay playsinline class="w-full h-full object-cover"></video>
+                                            </div>
+                                            <div id="pipLabel" class="absolute top-2 left-2 bg-black bg-opacity-70 text-white px-2 py-1 rounded text-xs">
+                                                Remote
+                                            </div>
+                                            <div class="absolute top-2 right-2 bg-blue-600 bg-opacity-80 text-white px-2 py-1 rounded text-xs">
+                                                Click to swap
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div class="bg-gray-800 p-4 flex justify-center gap-3 flex-wrap">
+                                    <button id="swapVideos" class="hidden"></button>
+                                    <button id="toggleAudio" class="bg-gray-700 hover:bg-gray-600 text-white py-2 px-4 rounded-lg text-sm">
+                                        🎤 Mute
+                                    </button>
+                                    <button id="toggleVideo" class="bg-gray-700 hover:bg-gray-600 text-white py-2 px-4 rounded-lg text-sm">
+                                        📹 Stop Video
+                                    </button>
+                                    <button id="shareScreen" class="bg-gray-700 hover:bg-gray-600 text-white py-2 px-4 rounded-lg text-sm">
+                                        🖥️ Share Screen
+                                    </button>
+                                    <button id="toggleRecord" class="bg-gray-700 hover:bg-gray-600 text-white py-2 px-4 rounded-lg text-sm">
+                                        ⏺️ Record
+                                    </button>
+                                    <button id="toggleChat" class="bg-gray-700 hover:bg-gray-600 text-white py-2 px-4 rounded-lg text-sm">
+                                        💬 Chat
+                                    </button>
+                                    <button id="endCall" class="bg-red-600 hover:bg-red-700 text-white py-2 px-4 rounded-lg text-sm">
+                                        ❌ End Call
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <!-- Chat Panel -->
+                            <div id="chatPanel" style="display: none;" class="w-80 bg-gray-800 flex-col border-l border-gray-700">
+                                <div class="p-4 border-b border-gray-700 flex items-center justify-between">
+                                    <h3 class="text-white font-semibold">Chat</h3>
+                                    <button onclick="document.getElementById('toggleChat').click()" class="text-gray-400 hover:text-white">
+                                        ✕
+                                    </button>
+                                </div>
+                                
+                                <div id="chatMessages" class="flex-1 overflow-y-auto p-4" style="max-height: calc(100vh - 200px);">
+                                    <div class="text-center text-gray-500 text-sm">No messages yet</div>
+                                </div>
+                                
+                                <div class="p-4 border-t border-gray-700">
+                                    <div class="flex gap-2">
+                                        <input 
+                                            type="text" 
+                                            id="messageInput" 
+                                            placeholder="Type a message..." 
+                                            class="flex-1 px-3 py-2 bg-gray-700 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                        />
+                                        <button id="sendMessage" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg">
+                                            Send
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        // Initialize app
+        window.addEventListener('DOMContentLoaded', () => {
+            new CoffeeChatProduction();
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+# Render Blueprint for One-Click Deploy
+# Click this to deploy: https://render.com/deploy
+
+services:
+  - type: web
+    name: coffee-chat-pro
+    env: node
+    region: oregon # Choose: oregon, frankfurt, singapore
+    plan: free # or: starter ($7/month)
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      # Add TURN server credentials (optional)
+      - key: METERED_USERNAME
+        sync: false # Set this in Render dashboard
+      - key: METERED_CREDENTIAL
+        sync: false # Set this in Render dashboard
+    # Auto-deploy on git push
+    autoDeploy: true
