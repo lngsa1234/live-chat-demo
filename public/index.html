@@ -38,6 +38,7 @@
                 this.showChat = false;
                 this.videoSwapped = false;
                 this.iceServers = null;
+                this.meetingIdFromURL = null;
                 
                 this.init();
             }
@@ -47,6 +48,27 @@
                 this.setupEventListeners();
                 // Fetch ICE servers from backend
                 await this.fetchIceServers();
+                // Check if joining from shareable link
+                this.checkMeetingURL();
+            }
+
+            checkMeetingURL() {
+                // Check if URL contains /meeting/xyz
+                const match = window.location.pathname.match(/\/meeting\/([a-z0-9-]+)/);
+                if (match) {
+                    this.meetingIdFromURL = match[1];
+                    console.log('📎 Detected meeting link:', this.meetingIdFromURL);
+                    
+                    // Auto-fill room ID and show join screen
+                    setTimeout(() => {
+                        const input = document.getElementById('roomIdInput');
+                        if (input) {
+                            input.value = this.meetingIdFromURL;
+                            // Show a helpful message
+                            this.updateStatus(`Ready to join meeting: ${this.meetingIdFromURL}`, 'blue');
+                        }
+                    }, 100);
+                }
             }
 
             async fetchIceServers() {
@@ -181,7 +203,14 @@
 
             async joinRoom() {
                 const input = document.getElementById('roomIdInput');
-                this.roomId = input?.value.trim() || this.generateRoomId();
+                
+                // Use meeting ID from URL if available, otherwise from input
+                if (this.meetingIdFromURL) {
+                    this.roomId = this.meetingIdFromURL;
+                    console.log('🔗 Joining from shareable link:', this.roomId);
+                } else {
+                    this.roomId = input?.value.trim() || this.generateRoomId();
+                }
                 
                 if (!this.roomId) {
                     alert('Please enter a room ID');
@@ -690,6 +719,21 @@
                 return Math.random().toString(36).substring(2, 10);
             }
 
+            generateShareableLink() {
+                const roomId = this.roomId || this.generateRoomId();
+                const link = `${window.location.origin}/meeting/${roomId}`;
+                
+                // Copy to clipboard
+                navigator.clipboard.writeText(link).then(() => {
+                    alert(`✅ Shareable link copied!\n\n${link}\n\nShare this link with your participant. They can click it to join directly!`);
+                }).catch(() => {
+                    // Fallback if clipboard doesn't work
+                    prompt('Copy this shareable link:', link);
+                });
+                
+                return link;
+            }
+
             showScreen(screenId) {
                 ['homeScreen', 'callScreen'].forEach(id => {
                     const el = document.getElementById(id);
@@ -715,6 +759,7 @@
                     document.getElementById('roomIdInput').value = this.generateRoomId();
                     this.joinRoom();
                 });
+                document.getElementById('shareLinkBtn')?.addEventListener('click', () => this.generateShareableLink());
                 document.getElementById('copyRoomId')?.addEventListener('click', () => this.copyRoomId());
                 document.getElementById('toggleAudio')?.addEventListener('click', () => this.toggleAudio());
                 document.getElementById('toggleVideo')?.addEventListener('click', () => this.toggleVideo());
@@ -785,13 +830,18 @@
                                 <button id="createBtn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition">
                                     Create New Room
                                 </button>
+                                
+                                <button id="shareLinkBtn" class="w-full bg-green-600 hover:bg-green-700 text-white font-semibold py-3 px-6 rounded-lg transition flex items-center justify-center gap-2">
+                                    <span>🔗</span>
+                                    <span>Get Shareable Link</span>
+                                </button>
                             </div>
 
                             <div id="status" class="text-sm mt-4 text-center"></div>
 
                             <div class="mt-6 p-4 bg-purple-50 border border-purple-200 rounded-lg">
                                 <p class="text-xs text-purple-800">
-                                    <strong>✨ Features:</strong> WebRTC P2P video, Real-time chat, Screen sharing, Call recording
+                                    <strong>✨ New:</strong> Click "Get Shareable Link" to generate a direct link. Share it with anyone - they can click to join instantly without entering a room ID!
                                 </p>
                             </div>
                         </div>

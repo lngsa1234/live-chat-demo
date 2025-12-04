@@ -56,6 +56,11 @@ app.get('/api/ice-servers', (req, res) => {
     res.json({ iceServers });
 });
 
+// Serve meeting page with auto-join
+app.get('/meeting/:meetingId', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
 // Store rooms and their participants
 const rooms = new Map();
 
